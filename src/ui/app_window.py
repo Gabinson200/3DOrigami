@@ -2,19 +2,16 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog
 import os
+import threading
 import numpy as np
-
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from matplotlib.collections import LineCollection
-from matplotlib.lines import Line2D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from mpl_toolkits.mplot3d import proj3d
-from matplotlib.colors import LightSource
-from stl import mesh
 
 from src.core.fold_parser import FoldParser
 from src.geometry.panels import PanelGenerator
+
+try:
+    import pyvista as pv
+except Exception:
+    pv = None
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -24,21 +21,15 @@ class OrigamiThickenerUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Rigid Origami Thickener")
-        self.geometry("900x600")
+        self.geometry("980x650")
 
         self.loaded_filepath = None
         self.fold_data = None
 
         self.current_stl_path = None
         self.current_thickness = None
-
-        self.preview_vectors = None
-        self.preview_bounds = None
-        self.preview_m_lines = []
-        self.preview_v_lines = []
-
-        self.overlay_artists = []
-        self._dragging_3d = False
+        self.viewer_plotter = None
+        self.viewer_thread = None
 
         self._build_ui()
 
@@ -94,10 +85,10 @@ class OrigamiThickenerUI(ctk.CTk):
         self.switch_show_folds = ctk.CTkSwitch(
             self.control_frame,
             text="Show Fold Lines",
-            command=self._refresh_overlay_only
+            command=self.refresh_external_preview
         )
         self.switch_show_folds.select()
-        self.switch_show_folds.pack(pady=(0, 20), padx=20, anchor="w")
+        self.switch_show_folds.pack(pady=(0, 12), padx=20, anchor="w")
 
         self.btn_generate = ctk.CTkButton(
             self.control_frame,
@@ -107,6 +98,14 @@ class OrigamiThickenerUI(ctk.CTk):
             font=ctk.CTkFont(weight="bold")
         )
         self.btn_generate.pack(pady=10, padx=20, fill="x")
+
+        self.btn_open_preview = ctk.CTkButton(
+            self.control_frame,
+            text="Open 3D Preview Window",
+            command=self.open_external_preview,
+            state="disabled"
+        )
+        self.btn_open_preview.pack(pady=(0, 10), padx=20, fill="x")
 
         self.tabview = ctk.CTkTabview(self)
         self.tabview.grid(row=0, column=1, padx=(0, 20), pady=20, sticky="nsew")
@@ -118,38 +117,50 @@ class OrigamiThickenerUI(ctk.CTk):
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
 
-        self.fig = Figure(figsize=(5, 5), dpi=100, facecolor="#2B2B2B")
-        self.fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        preview_wrap = ctk.CTkFrame(self.tab_3d, corner_radius=0, fg_color="transparent")
+        preview_wrap.pack(fill="both", expand=True, padx=20, pady=20)
 
-        self.ax = self.fig.add_subplot(111, projection="3d")
-        self.ax.set_facecolor("#2B2B2B")
-        self.ax.axis("off")
-        self.ax.view_init(elev=28, azim=-58)
+        title = ctk.CTkLabel(
+            preview_wrap,
+            text="Interactive 3D Preview",
+            font=ctk.CTkFont(size=22, weight="bold")
+        )
+        title.pack(pady=(10, 12))
 
-        self.canvas_3d = FigureCanvasTkAgg(self.fig, master=self.tab_3d)
-        self.canvas_3d.get_tk_widget().pack(fill="both", expand=True)
+        self.preview_status = ctk.CTkLabel(
+            preview_wrap,
+            text=(
+                "Generate a mesh, then open the VTK/PyVista preview window.\n\n"
+                "This avoids Matplotlib's 3D rendering artifacts and uses a real 3D renderer instead."
+            ),
+            justify="center"
+        )
+        self.preview_status.pack(pady=(0, 18))
 
-        self.canvas_3d.mpl_connect("button_press_event", self._on_3d_press)
-        self.canvas_3d.mpl_connect("button_release_event", self._on_3d_release)
-        self.canvas_3d.mpl_connect("resize_event", self._on_3d_resize)
-        self.canvas_3d.mpl_connect("scroll_event", self._on_3d_scroll)
+        self.btn_open_preview_tab = ctk.CTkButton(
+            preview_wrap,
+            text="Open 3D Preview Window",
+            command=self.open_external_preview,
+            state="disabled",
+            height=42
+        )
+        self.btn_open_preview_tab.pack(pady=(0, 18))
 
-    def _on_3d_press(self, event):
-        if event.inaxes == self.ax:
-            self._dragging_3d = True
-            self._clear_overlay()
-            self.canvas_3d.draw_idle()
-
-    def _on_3d_release(self, event):
-        if self._dragging_3d:
-            self._dragging_3d = False
-            self._refresh_overlay_only()
-
-    def _on_3d_resize(self, event):
-        self._refresh_overlay_only()
-
-    def _on_3d_scroll(self, event):
-        self._refresh_overlay_only()
+        self.preview_hint = ctk.CTkTextbox(preview_wrap, height=220)
+        self.preview_hint.pack(fill="both", expand=True)
+        self.preview_hint.insert(
+            "1.0",
+            "Why this uses a separate window:\n\n"
+            "• The pip/binary VTK packages do not ship the old Tk rendering bridge needed by vtkTkRenderWindowInteractor on Windows.\n"
+            "• A separate PyVista window still uses VTK underneath, but avoids the missing vtkRenderingTk DLL problem.\n"
+            "• It also gives you real depth buffering, better shading, and no Matplotlib triangle flicker.\n\n"
+            "Viewer controls:\n"
+            "• Left drag: rotate\n"
+            "• Middle drag / Shift+Left: pan\n"
+            "• Scroll: zoom\n"
+            "• Press r: reset camera\n"
+        )
+        self.preview_hint.configure(state="disabled")
 
     def load_file(self):
         filepath = filedialog.askopenfilename(
@@ -162,16 +173,13 @@ class OrigamiThickenerUI(ctk.CTk):
                 text_color="#00FF00"
             )
             self.fold_data = FoldParser(self.loaded_filepath).parse()
-
             self.current_stl_path = None
             self.current_thickness = None
-            self.preview_vectors = None
-            self.preview_bounds = None
-            self.preview_m_lines = []
-            self.preview_v_lines = []
-
-            self._clear_overlay()
-
+            self.btn_open_preview.configure(state="disabled")
+            self.btn_open_preview_tab.configure(state="disabled")
+            self.preview_status.configure(
+                text="Pattern loaded. Generate a mesh to open the interactive 3D preview."
+            )
             self.tabview.set("2D Pattern")
             self.draw_pattern()
 
@@ -218,54 +226,6 @@ class OrigamiThickenerUI(ctk.CTk):
                 width=5
             )
 
-    def _load_preview_mesh(self):
-        if not self.current_stl_path or not os.path.exists(self.current_stl_path):
-            return
-
-        preview_mesh = mesh.Mesh.from_file(self.current_stl_path)
-        self.preview_vectors = np.array(preview_mesh.vectors, copy=True)
-
-        pts = self.preview_vectors.reshape(-1, 3)
-        self.preview_bounds = (pts.min(axis=0), pts.max(axis=0))
-
-        self._build_preview_line_cache()
-
-    def _build_preview_line_cache(self):
-        self.preview_m_lines = []
-        self.preview_v_lines = []
-
-        if not self.fold_data or self.current_thickness is None:
-            return
-
-        vertices = self.fold_data["vertices"]
-        edges = self.fold_data["edges"]
-        assignments = self.fold_data["assignments"]
-
-        lift = max(0.6, 0.15 * float(self.current_thickness))
-        top_z = float(self.current_thickness) + lift
-        bottom_z = -lift
-
-        for i, edge in enumerate(edges):
-            if i >= len(assignments):
-                continue
-
-            assign = assignments[i]
-            if assign not in ("M", "V"):
-                continue
-
-            v1 = vertices[edge[0]]
-            v2 = vertices[edge[1]]
-
-            segment = [
-                (v1[0], v1[1], top_z if assign == "M" else bottom_z),
-                (v2[0], v2[1], top_z if assign == "M" else bottom_z),
-            ]
-
-            if assign == "M":
-                self.preview_m_lines.append(segment)
-            else:
-                self.preview_v_lines.append(segment)
-
     def generate_mesh(self):
         if not self.fold_data:
             self.lbl_filename.configure(
@@ -293,143 +253,135 @@ class OrigamiThickenerUI(ctk.CTk):
             self.current_stl_path = stl_path
             self.current_thickness = thickness
 
-            self._load_preview_mesh()
-            self.update_3d_view()
-
+            self.btn_open_preview.configure(state="normal")
+            self.btn_open_preview_tab.configure(state="normal")
+            self.preview_status.configure(
+                text="Mesh generated. Open the interactive 3D preview window."
+            )
             self.tabview.set("3D Preview")
+            self.refresh_external_preview(auto_open=True)
         finally:
             self.btn_generate.configure(text="Generate 3D Mesh", state="normal")
 
-    def _clear_overlay(self):
-        for artist in self.overlay_artists:
-            try:
-                artist.remove()
-            except Exception:
-                pass
-        self.overlay_artists = []
+    def _build_fold_polydata(self, assignment_filter, z_value):
+        if pv is None or not self.fold_data:
+            return None
 
-    def _project_segments_to_figure(self, segments):
-        if not segments:
-            return []
+        vertices = self.fold_data["vertices"]
+        edges = self.fold_data["edges"]
+        assignments = self.fold_data["assignments"]
 
-        projected = []
+        points = []
+        lines = []
+        point_index = 0
 
-        for seg in segments:
-            (x1, y1, z1), (x2, y2, z2) = seg
+        for i, edge in enumerate(edges):
+            if i >= len(assignments) or assignments[i] != assignment_filter:
+                continue
 
-            x1p, y1p, _ = proj3d.proj_transform(x1, y1, z1, self.ax.get_proj())
-            x2p, y2p, _ = proj3d.proj_transform(x2, y2, z2, self.ax.get_proj())
+            v1 = vertices[edge[0]]
+            v2 = vertices[edge[1]]
+            points.append([v1[0], v1[1], z_value])
+            points.append([v2[0], v2[1], z_value])
+            lines.append([2, point_index, point_index + 1])
+            point_index += 2
 
-            p1_disp = self.ax.transData.transform((x1p, y1p))
-            p2_disp = self.ax.transData.transform((x2p, y2p))
+        if not points:
+            return None
 
-            p1_fig = self.fig.transFigure.inverted().transform(p1_disp)
-            p2_fig = self.fig.transFigure.inverted().transform(p2_disp)
+        poly = pv.PolyData()
+        poly.points = np.array(points, dtype=float)
+        poly.lines = np.array(lines, dtype=np.int64).ravel()
+        return poly
 
-            projected.append([p1_fig, p2_fig])
+    def _make_tube(self, poly, radius):
+        if poly is None:
+            return None
+        return poly.tube(radius=radius, n_sides=18, capping=True)
 
-        return projected
-
-    def _add_overlay_collection(self, segments_2d, color, halo_color, halo_width, line_width):
-        if not segments_2d:
+    def _open_plotter(self):
+        if pv is None:
+            self.preview_status.configure(
+                text="PyVista is not installed. Run: pip install pyvista"
+            )
             return
 
-        halo = LineCollection(
-            segments_2d,
-            colors=[halo_color],
-            linewidths=halo_width,
-            capstyle="round",
-            joinstyle="round",
-            transform=self.fig.transFigure
-        )
-        halo.set_clip_on(False)
-
-        line = LineCollection(
-            segments_2d,
-            colors=[color],
-            linewidths=line_width,
-            capstyle="round",
-            joinstyle="round",
-            transform=self.fig.transFigure
-        )
-        line.set_clip_on(False)
-
-        self.fig.add_artist(halo)
-        self.fig.add_artist(line)
-
-        self.overlay_artists.append(halo)
-        self.overlay_artists.append(line)
-
-    def _draw_overlay_fold_lines(self):
-        self._clear_overlay()
-
-        if self.switch_show_folds.get() != 1:
+        if not self.current_stl_path or not os.path.exists(self.current_stl_path):
+            self.preview_status.configure(
+                text="Generate a mesh first before opening the preview."
+            )
             return
 
-        m2d = self._project_segments_to_figure(self.preview_m_lines)
-        v2d = self._project_segments_to_figure(self.preview_v_lines)
-
-        self._add_overlay_collection(
-            m2d,
-            color="#FF3B30",
-            halo_color=(0.02, 0.02, 0.02, 0.98),
-            halo_width=8.0,
-            line_width=4.5
-        )
-
-        self._add_overlay_collection(
-            v2d,
-            color="#2D7FFF",
-            halo_color=(0.02, 0.02, 0.02, 0.98),
-            halo_width=8.0,
-            line_width=4.5
-        )
-
-    def _refresh_overlay_only(self):
-        if self.preview_vectors is None:
-            return
-        self._draw_overlay_fold_lines()
-        self.canvas_3d.draw_idle()
-
-    def update_3d_view(self):
-        if self.preview_vectors is None:
-            self._load_preview_mesh()
-        if self.preview_vectors is None:
+        try:
+            solid = pv.read(self.current_stl_path)
+        except Exception as exc:
+            self.preview_status.configure(text=f"Could not open STL: {exc}")
             return
 
-        self._clear_overlay()
+        pl = pv.Plotter(title="Origami Thickener Preview", window_size=(1100, 850))
 
-        self.ax.clear()
-        self.ax.set_facecolor("#2B2B2B")
-        self.ax.axis("off")
-        self.ax.view_init(elev=28, azim=-58)
+        try:
+            pl.enable_anti_aliasing("fxaa")
+        except Exception:
+            pass
 
-        ls = LightSource(azdeg=315, altdeg=38)
+        try:
+            pl.enable_ssao(radius=0.04)
+        except Exception:
+            pass
 
-        collection = Poly3DCollection(
-            self.preview_vectors,
-            facecolors=(0.86, 0.86, 0.86, 1.0),
-            edgecolors=(0.0, 0.0, 0.0, 0.0),
-            linewidths=0.0,
-            antialiased=False,
-            shade=True,
-            lightsource=ls
+        solid_actor = pl.add_mesh(
+            solid,
+            color="#d9d9d9",
+            smooth_shading=True,
+            split_sharp_edges=True,
+            show_edges=False,
+            specular=0.18,
+            specular_power=18,
+            ambient=0.20,
+            diffuse=0.85,
         )
-        self.ax.add_collection3d(collection)
 
-        mins, maxs = self.preview_bounds
-        dx, dy, dz = maxs - mins
-        pad = max(1.0, 0.03 * max(dx, dy, dz, 1.0))
+        if self.switch_show_folds.get() == 1 and self.current_thickness is not None:
+            lift = max(0.30, 0.10 * float(self.current_thickness))
+            tube_radius = max(0.35, 0.18 * float(self.current_thickness))
+            halo_radius = tube_radius * 1.9
 
-        self.ax.set_xlim(mins[0] - pad, maxs[0] + pad)
-        self.ax.set_ylim(mins[1] - pad, maxs[1] + pad)
-        self.ax.set_zlim(mins[2] - pad, maxs[2] + pad)
+            m_poly = self._build_fold_polydata("M", float(self.current_thickness) + lift)
+            v_poly = self._build_fold_polydata("V", -lift)
 
-        self.ax.set_box_aspect((
-            max(dx, 1.0),
-            max(dy, 1.0),
-            max(dz, 1.0)
-        ))
+            m_halo = self._make_tube(m_poly, halo_radius)
+            v_halo = self._make_tube(v_poly, halo_radius)
+            m_tube = self._make_tube(m_poly, tube_radius)
+            v_tube = self._make_tube(v_poly, tube_radius)
 
-        self._draw_overlay_fold_lines()
-        self.canvas_3d.draw_idle()
+            if m_halo is not None:
+                pl.add_mesh(m_halo, color="black", lighting=False)
+            if v_halo is not None:
+                pl.add_mesh(v_halo, color="black", lighting=False)
+            if m_tube is not None:
+                pl.add_mesh(m_tube, color="#ff3b30", lighting=False)
+            if v_tube is not None:
+                pl.add_mesh(v_tube, color="#2d7fff", lighting=False)
+
+        pl.set_background("#2B2B2B")
+        pl.add_axes(line_width=2, color="white")
+        pl.show_grid(color="#666666")
+        pl.camera_position = "iso"
+        pl.camera.zoom(1.15)
+        pl.show()
+
+    def open_external_preview(self):
+        if pv is None:
+            self.preview_status.configure(
+                text="PyVista is not installed. Run: pip install pyvista"
+            )
+            return
+
+        self._open_plotter()
+
+    def refresh_external_preview(self, auto_open=False):
+        if auto_open and self.current_stl_path and pv is not None:
+            self.after(100, self.open_external_preview)
+
+
