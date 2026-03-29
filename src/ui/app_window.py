@@ -24,6 +24,11 @@ class OrigamiThickenerUI(ctk.CTk):
         
         self.loaded_filepath = None
         self.fold_data = None
+        
+        # State caching so we don't have to re-run the CAD engine just to toggle lines
+        self.current_stl_path = None
+        self.current_thickness = None
+        
         self._build_ui()
 
     def _build_ui(self):
@@ -52,7 +57,16 @@ class OrigamiThickenerUI(ctk.CTk):
         self.lbl_hinge = ctk.CTkLabel(self.control_frame, text="Hinge Topology")
         self.lbl_hinge.pack(anchor="w", padx=20)
         self.combo_hinge = ctk.CTkComboBox(self.control_frame, values=["Print-in-Place (Knuckle)", "Living Hinge (Bridged)"])
-        self.combo_hinge.pack(pady=(0, 30), padx=20, fill="x")
+        self.combo_hinge.pack(pady=(0, 15), padx=20, fill="x")
+
+        # --- NEW: Fold Line Toggle Switch ---
+        self.switch_show_folds = ctk.CTkSwitch(
+            self.control_frame, 
+            text="Show Fold Lines", 
+            command=self.update_3d_view # Triggers a fast re-render
+        )
+        self.switch_show_folds.select() # Default to ON
+        self.switch_show_folds.pack(pady=(0, 20), padx=20, anchor="w")
 
         self.btn_generate = ctk.CTkButton(self.control_frame, text="Generate 3D Mesh", command=self.generate_mesh, height=40, font=ctk.CTkFont(weight="bold"))
         self.btn_generate.pack(pady=10, padx=20, fill="x")
@@ -108,7 +122,7 @@ class OrigamiThickenerUI(ctk.CTk):
             self.canvas.create_line(
                 off_x + (v1[0] - min_x) * scale, off_y + (max_y - v1[1]) * scale,
                 off_x + (v2[0] - min_x) * scale, off_y + (max_y - v2[1]) * scale,
-                fill=color_map.get(assign, '#888888'), width=2
+                fill=color_map.get(assign, '#888888'), width=5
             )
 
     def generate_mesh(self):
@@ -121,26 +135,40 @@ class OrigamiThickenerUI(ctk.CTk):
         
         thickness = float(self.entry_thickness.get())
         
+        # Heavy CAD operation
         generator = PanelGenerator(self.fold_data, thickness)
         assembly, stl_path = generator.generate_base_panels()
         
-        self.render_3d_preview(stl_path, thickness)
+        # Cache the results
+        self.current_stl_path = stl_path
+        self.current_thickness = thickness
+        
+        # Fast render
+        self.update_3d_view()
         
         self.tabview.set("3D Preview") 
         self.btn_generate.configure(text="Generate 3D Mesh", state="normal")
 
-    def render_3d_preview(self, stl_filepath, thickness):
+    def update_3d_view(self):
+        """Fast 3D render function that uses cached geometry."""
+        if not self.current_stl_path or not os.path.exists(self.current_stl_path):
+            return
+
         self.ax.clear()
         self.ax.axis('off')
         
-        your_mesh = mesh.Mesh.from_file(stl_filepath)
+        your_mesh = mesh.Mesh.from_file(self.current_stl_path)
         ls = LightSource(azdeg=315, altdeg=45)
         
+        # --- THE FIX FOR GHOST TRIANGLES ---
+        # Setting edgecolors='face' forces the edges to perfectly match the 
+        # shaded color of the faces, seamlessly hiding the STL triangulation cracks.
         collection = Poly3DCollection(
             your_mesh.vectors, 
             facecolors='#DDDDDD',
-            linewidths=0, 
-            alpha=1.0,
+            edgecolors=(0, 0, 0, 0),    # <--- Welds the triangles together visually
+            linewidths=0.1,       # <--- Tiny overlap to fill the anti-aliasing gap
+            antialiased=False,     
             shade=True,
             lightsource=ls
         )
@@ -150,30 +178,31 @@ class OrigamiThickenerUI(ctk.CTk):
         edges = self.fold_data['edges']
         assignments = self.fold_data['assignments']
         
-        for i, edge in enumerate(edges):
-            if i >= len(assignments): continue
-            
-            assign = assignments[i]
-            if assign in ['M', 'V']:
-                v1 = vertices[edge[0]]
-                v2 = vertices[edge[1]]
+        if self.switch_show_folds.get() == 1:
+            for i, edge in enumerate(edges):
+                if i >= len(assignments): continue
                 
-                # Align lines tightly to the flush faces
-                if assign == 'M':
-                    z = thickness + 0.05 
-                    color = '#FF4444' # Red on top
-                else:
-                    z = -0.05
-                    color = '#4444FF' # Blue on bottom
+                assign = assignments[i]
+                if assign in ['M', 'V']:
+                    v1 = vertices[edge[0]]
+                    v2 = vertices[edge[1]]
                     
-                self.ax.plot(
-                    [v1[0], v2[0]], 
-                    [v1[1], v2[1]], 
-                    [z, z], 
-                    color=color, linewidth=2.5
-                )
+                    # --- THE FIX FOR INVISIBLE LINES ---
+                    # Float the lines 0.75mm away from the surface so Matplotlib 
+                    # doesn't swallow them in the Z-buffer, and use pure neon colors.
+                    if assign == 'M':
+                        z = self.current_thickness + 0.75 
+                        color = '#FF0000' # Pure Red
+                    else:
+                        z = -0.75
+                        color = '#0066FF' # Pure Bright Blue
+                        
+                    self.ax.plot(
+                        [v1[0], v2[0]], [v1[1], v2[1]], [z, z], 
+                        color=color, linewidth=5.0, zorder = 10
+                    )
         
-        # THE FIX: Real-World Aspect Ratio Locking
+        # Real-World Aspect Ratio Locking
         all_x = [v[0] for v in vertices]
         all_y = [v[1] for v in vertices]
         
@@ -182,13 +211,11 @@ class OrigamiThickenerUI(ctk.CTk):
         
         self.ax.set_xlim(min_x, max_x)
         self.ax.set_ylim(min_y, max_y)
-        self.ax.set_zlim(-2, thickness + 2)
+        self.ax.set_zlim(-2, self.current_thickness + 2)
         
         x_range = max_x - min_x
         y_range = max_y - min_y
-        z_range = thickness + 4.0 
+        z_range = self.current_thickness + 4.0 
         
-        # Force Matplotlib to render true physical proportions
         self.ax.set_box_aspect((x_range, y_range, z_range))
-        
         self.canvas_3d.draw()
