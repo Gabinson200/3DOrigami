@@ -347,18 +347,18 @@ class OrigamiThickenerUI(ctk.CTk):
             tube_radius = max(0.35, 0.18 * float(self.current_thickness))
             halo_radius = tube_radius * 1.9
 
-            m_poly = self._build_fold_polydata("M", float(self.current_thickness) + lift)
-            v_poly = self._build_fold_polydata("V", -lift)
+            m_poly = self._build_fold_polydata("M", -lift)
+            v_poly = self._build_fold_polydata("V", float(self.current_thickness) + lift)
 
-            m_halo = self._make_tube(m_poly, halo_radius)
-            v_halo = self._make_tube(v_poly, halo_radius)
+            #m_halo = self._make_tube(m_poly, halo_radius)
+            #v_halo = self._make_tube(v_poly, halo_radius)
             m_tube = self._make_tube(m_poly, tube_radius)
             v_tube = self._make_tube(v_poly, tube_radius)
 
-            if m_halo is not None:
-                pl.add_mesh(m_halo, color="black", lighting=False)
-            if v_halo is not None:
-                pl.add_mesh(v_halo, color="black", lighting=False)
+            #if m_halo is not None:
+            #    pl.add_mesh(m_halo, color="black", lighting=False)
+            #if v_halo is not None:
+            #    pl.add_mesh(v_halo, color="black", lighting=False)
             if m_tube is not None:
                 pl.add_mesh(m_tube, color="#ff3b30", lighting=False)
             if v_tube is not None:
